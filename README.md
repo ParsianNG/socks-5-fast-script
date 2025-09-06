@@ -10,7 +10,7 @@ wget https://raw.githubusercontent.com/ParsianNG/socks-5-fast-script/main/socks5
 chmod +x socks5-setup.sh
 
 # Запустите установку
-sudo ./socks5-setup.sh install
+sudo ./socks5-setup.sh
 ```
 
 ### Интерактивная установка
