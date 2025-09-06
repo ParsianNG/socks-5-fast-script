@@ -18,6 +18,7 @@ NC='\033[0m' # No Color
 PROXY_USER=""
 PROXY_PASS=""
 USE_AUTH=false
+PROXY_PORT=1080
 
 # ASCII Art для GOSHA SCRIPT
 show_banner() {
@@ -42,6 +43,17 @@ show_banner() {
     echo -e "${PURPLE}║              ${YELLOW}Простой и надежный прокси сервер${PURPLE}              ║${NC}"
     echo -e "${PURPLE}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
+}
+
+# Загрузка порта из существующей конфигурации
+load_existing_port() {
+    if [[ -f /etc/danted.conf ]]; then
+        local port=$(grep "internal:" /etc/danted.conf | grep "port =" | sed 's/.*port = \([0-9]*\).*/\1/')
+        if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]]; then
+            PROXY_PORT=$port
+            info "Загружен порт из существующей конфигурации: $PROXY_PORT"
+        fi
+    fi
 }
 
 # Генерация случайного логина
@@ -79,7 +91,7 @@ generate_credentials() {
 # Password: $PROXY_PASS
 # 
 # Server: $(get_server_ip)
-# Port: 1080
+# Port: $PROXY_PORT
 # Type: SOCKS5
 EOF
     
@@ -231,9 +243,13 @@ EOF
 setup_dante() {
     log "Настройка Dante SOCKS5 сервера..."
     
+    # Выбираем порт
+    select_port
+    
     # Получаем IP сервера
     local server_ip=$(get_server_ip)
     info "IP сервера: $server_ip"
+    info "Порт прокси: $PROXY_PORT"
     
     # Спрашиваем про аутентификацию
     echo ""
@@ -277,7 +293,7 @@ user.privileged: root
 user.unprivileged: nobody
 
 # Интерфейс для прослушивания
-internal: 0.0.0.0 port = 1080
+internal: 0.0.0.0 port = $PROXY_PORT
 
 # Внешний интерфейс
 external: $server_ip
@@ -308,7 +324,7 @@ user.privileged: root
 user.unprivileged: nobody
 
 # Интерфейс для прослушивания
-internal: 0.0.0.0 port = 1080
+internal: 0.0.0.0 port = $PROXY_PORT
 
 # Внешний интерфейс
 external: $server_ip
@@ -412,7 +428,7 @@ remove_config() {
 
 # Проверка порта
 check_port() {
-    local port=1080
+    local port=${1:-$PROXY_PORT}
     if netstat -tlnp 2>/dev/null | grep -q ":$port "; then
         warning "Порт $port уже занят"
         info "Занятые порты:"
@@ -420,6 +436,82 @@ check_port() {
         return 1
     fi
     return 0
+}
+
+# Выбор альтернативного порта
+select_port() {
+    local default_port=1080
+    local port=$default_port
+    
+    # Загружаем существующий порт, если конфигурация уже есть
+    load_existing_port
+    
+    # Если порт уже загружен из конфигурации, используем его
+    if [[ $PROXY_PORT != 1080 ]]; then
+        info "Используется существующий порт: $PROXY_PORT"
+        return 0
+    fi
+    
+    # Проверяем, занят ли порт по умолчанию
+    if ! check_port $default_port; then
+        echo ""
+        echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}║                ${WHITE}ВЫБОР ПОРТА ДЛЯ ПРОКСИ${YELLOW}                ║${NC}"
+        echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${WHITE}Порт $default_port занят. Выберите альтернативный порт:${NC}"
+        echo ""
+        
+        # Предлагаем популярные альтернативные порты
+        local suggested_ports=(1081 1082 1083 1084 1085 8080 8081 8082 3128 9050)
+        echo -e "${GREEN}Рекомендуемые порты:${NC}"
+        for i in "${!suggested_ports[@]}"; do
+            local suggested_port=${suggested_ports[$i]}
+            if check_port $suggested_port 2>/dev/null; then
+                echo -e "${GREEN}$((i+1)))${NC} $suggested_port ${GREEN}(свободен)${NC}"
+            else
+                echo -e "${RED}$((i+1)))${NC} $suggested_port ${RED}(занят)${NC}"
+            fi
+        done
+        echo -e "${GREEN}$((${#suggested_ports[@]}+1)))${NC} Ввести свой порт"
+        echo ""
+        
+        while true; do
+            read -p "Выберите номер (1-$((${#suggested_ports[@]}+1))): " choice
+            
+            if [[ "$choice" =~ ^[0-9]+$ ]]; then
+                if [[ $choice -ge 1 && $choice -le ${#suggested_ports[@]} ]]; then
+                    port=${suggested_ports[$((choice-1))]}
+                    if check_port $port 2>/dev/null; then
+                        break
+                    else
+                        warning "Порт $port тоже занят. Выберите другой."
+                    fi
+                elif [[ $choice -eq $((${#suggested_ports[@]}+1)) ]]; then
+                    while true; do
+                        read -p "Введите номер порта (1024-65535): " custom_port
+                        if [[ "$custom_port" =~ ^[0-9]+$ ]] && [[ $custom_port -ge 1024 && $custom_port -le 65535 ]]; then
+                            if check_port $custom_port 2>/dev/null; then
+                                port=$custom_port
+                                break 2
+                            else
+                                warning "Порт $custom_port занят. Попробуйте другой."
+                            fi
+                        else
+                            error "Введите корректный номер порта (1024-65535)"
+                        fi
+                    done
+                else
+                    error "Неверный выбор. Попробуйте снова."
+                fi
+            else
+                error "Введите число от 1 до $((${#suggested_ports[@]}+1))"
+            fi
+        done
+    fi
+    
+    PROXY_PORT=$port
+    success "Выбран порт: $PROXY_PORT"
 }
 
 # Управление сервисом
@@ -431,8 +523,8 @@ manage_service() {
             log "Запуск SOCKS5 прокси..."
             
             # Проверяем порт
-            if ! check_port; then
-                error "Порт 1080 занят. Остановите конфликтующий сервис или измените порт в конфигурации"
+            if ! check_port $PROXY_PORT; then
+                error "Порт $PROXY_PORT занят. Остановите конфликтующий сервис или измените порт в конфигурации"
                 return 1
             fi
             
@@ -530,6 +622,7 @@ uninstall() {
 
 # Показать информацию о прокси
 show_info() {
+    load_existing_port
     local server_ip=$(get_server_ip)
     
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -537,7 +630,7 @@ show_info() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${BOLD}Сервер:${NC} $server_ip"
-    echo -e "${BOLD}Порт:${NC} 1080"
+    echo -e "${BOLD}Порт:${NC} $PROXY_PORT"
     echo -e "${BOLD}Тип:${NC} SOCKS5"
     
     # Проверяем, есть ли аутентификация
@@ -561,7 +654,7 @@ show_info() {
     echo -e "${YELLOW}Настройки для клиентов:${NC}"
     echo "  • Тип прокси: SOCKS5"
     echo "  • Адрес: $server_ip"
-    echo "  • Порт: 1080"
+    echo "  • Порт: $PROXY_PORT"
     
     if [[ -f /etc/socks5-credentials.txt ]]; then
         local username=$(grep "^# Username:" /etc/socks5-credentials.txt | sed 's/^# Username: //')
@@ -638,6 +731,7 @@ regenerate_credentials() {
 
 # Диагностика проблем
 diagnose() {
+    load_existing_port
     echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${YELLOW}║                  ${WHITE}ДИАГНОСТИКА ПРОКСИ${YELLOW}                  ║${NC}"
     echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
@@ -654,12 +748,12 @@ diagnose() {
         danted -f /etc/danted.conf -V
     fi
     
-    echo -e "\n${BOLD}3. Проверка порта 1080:${NC}"
-    if netstat -tlnp 2>/dev/null | grep -q ":1080 "; then
-        echo -e "${GREEN}✓ Порт 1080 занят (это нормально если прокси работает)${NC}"
-        netstat -tlnp | grep ":1080 "
+    echo -e "\n${BOLD}3. Проверка порта $PROXY_PORT:${NC}"
+    if netstat -tlnp 2>/dev/null | grep -q ":$PROXY_PORT "; then
+        echo -e "${GREEN}✓ Порт $PROXY_PORT занят (это нормально если прокси работает)${NC}"
+        netstat -tlnp | grep ":$PROXY_PORT "
     else
-        echo -e "${RED}✗ Порт 1080 свободен (прокси не работает)${NC}"
+        echo -e "${RED}✗ Порт $PROXY_PORT свободен (прокси не работает)${NC}"
     fi
     
     echo -e "\n${BOLD}4. Проверка файлов пользователей:${NC}"
