@@ -4,7 +4,7 @@
 
 ```bash
 # Скачайте скрипт
-wget https://github.com/ParsianNG/socks-5-fast-script/socks5-setup.sh
+wget https://github.com/ParsianNG/socks-5-fast-script.git
 
 # Сделайте исполняемым
 chmod +x socks5-setup.sh
