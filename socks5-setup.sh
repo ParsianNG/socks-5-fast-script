@@ -1,37 +1,30 @@
 #!/bin/bash
-# Скрипт установки и управления SOCKS5 (Dante/sockd) с PAM-аутентификацией (libpam-pwdfile)
+# Скрипт установки и управления SOCKS5 (Dante server) с PAM-аутентификацией (libpam-pwdfile)
 
 set -e
 
+# ----- PATH фикс (sudo/cron иногда урезают PATH) -----
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin:$PATH"
+
 # ===== Цвета =====
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-BOLD='\033[1m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+PURPLE='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ===== Глобальные переменные =====
-PROXY_USER=""
-PROXY_PASS=""
-USE_AUTH=false
-PROXY_PORT=1080
-
-CRED_FILE="/etc/socks5-credentials.txt"  # человеко-читаемый (для вывода)
-PASSWD_FILE="/etc/danted.passwd"         # файл паролей PAM (htpasswd формат)
-PAM_FILE="/etc/pam.d/sockd"              # PAM профиль
-CONF_FILE="/etc/danted.conf"             # конфиг Dante
+PROXY_USER=""; PROXY_PASS=""; USE_AUTH=false; PROXY_PORT=1080
+CRED_FILE="/etc/socks5-credentials.txt"     # человеко-читаемый вывод
+PASSWD_FILE="/etc/danted.passwd"            # htpasswd (для PAM)
+PAM_FILE="/etc/pam.d/sockd"                 # PAM профиль
+CONF_FILE="/etc/danted.conf"                # конфиг Dante
 SERVICE_FILE="/etc/systemd/system/socks5-proxy.service"
+DAEMON_BIN=""                               # сюда определим sockd/danted
 
-# ===== Утилиты логирования =====
-log()      { echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"; }
-error()    { echo -e "${RED}[ERROR]${NC} $1" >&2; }
-warning()  { echo -e "${YELLOW}[WARNING]${NC} $1"; }
-info()     { echo -e "${BLUE}[INFO]${NC} $1"; }
-success()  { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+# ===== Логи =====
+log(){ echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"; }
+error(){ echo -e "${RED}[ERROR]${NC} $1" >&2; }
+warning(){ echo -e "${YELLOW}[WARNING]${NC} $1"; }
+info(){ echo -e "${BLUE}[INFO]${NC} $1"; }
+success(){ echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 
 # ===== Баннер =====
 show_banner() {
@@ -58,33 +51,32 @@ show_banner() {
   echo ""
 }
 
-# ===== Проверки прав/системы =====
-check_root() {
+# ===== Проверки =====
+check_root(){
   if [[ $EUID -ne 0 ]]; then
-    error "Скрипт должен быть запущен с правами root. Используйте: sudo $0"
+    error "Скрипт должен быть запущен с root. Используйте: sudo $0"
     exit 1
   fi
 }
 
-check_system() {
+check_system(){
   log "Проверка системы..."
   if [[ -f /etc/debian_version ]]; then
     info "Обнаружен Debian/Ubuntu"
   elif [[ -f /etc/redhat-release ]]; then
-    error "Этот скрипт ориентирован на Debian/Ubuntu. Для RHEL/CentOS используйте аналог с yum/dnf."
+    error "Скрипт рассчитан на Debian/Ubuntu. (Для RHEL/CentOS используйте dnf/yum-аналог.)"
     exit 1
   else
-    warning "Неизвестный дистрибутив — продолжим, но возможны ошибки."
+    warning "Неизвестный дистрибутив — продолжим на свой риск."
   fi
 }
 
-# ===== APT "анлок" =====
-force_kill_apt() {
+force_kill_apt(){
   log "Принудительное завершение apt/dpkg..."
   pkill -9 -f "apt" 2>/dev/null || true
   pkill -9 -f "dpkg" 2>/dev/null || true
   pkill -9 -f "unattended-upgrade" 2>/dev/null || true
-  sleep 2
+  sleep 1
   rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
         /var/cache/apt/archives/lock /var/lib/apt/lists/lock
   rm -f /var/cache/apt/archives/partial/* 2>/dev/null || true
@@ -94,52 +86,73 @@ force_kill_apt() {
   success "APT разблокирован"
 }
 
-# ===== Установка зависимостей =====
-install_dependencies() {
+# ===== Установка пакетов =====
+install_dependencies(){
   log "Обновление и установка пакетов..."
   force_kill_apt
   apt-get update -qq
   apt-get install -y python3 python3-pip dante-server libpam-pwdfile net-tools apache2-utils
 
-  # Проверяем наличие бинаря sockd
-  if ! command -v sockd &>/dev/null; then
-    error "Dante (sockd) не установлен корректно"
+  resolve_daemon_bin  # определим DAEMON_BIN (sockd/danted)
+  if [[ -z "$DAEMON_BIN" ]]; then
+    error "Не найден бинарь Dante (sockd/danted), хотя пакет установлен. Проверьте установку."
+    dpkg -L dante-server | grep -E '/(sockd|danted)$' || true
     exit 1
   fi
   success "Зависимости установлены"
 }
 
-# ===== IP сервера =====
-get_server_ip() {
-  local ip
-  ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}' | head -1)
-  if [[ -z "$ip" ]]; then
-    ip=$(hostname -I | awk '{print $1}')
+# ===== Определение бинаря сервера (sockd|danted) =====
+resolve_daemon_bin(){
+  # Предпочитаем sockd
+  if type -P sockd >/dev/null 2>&1; then
+    DAEMON_BIN="$(type -P sockd)"
+    return
   fi
+  # Фолбэк на danted
+  if type -P danted >/dev/null 2>&1; then
+    DAEMON_BIN="$(type -P danted)"
+    return
+  fi
+  # Последний шанс: поиск в dante-server
+  local cand
+  cand="$(dpkg -L dante-server 2>/dev/null | grep -E '/(sockd|danted)$' | head -1 || true)"
+  if [[ -n "$cand" && -x "$cand" ]]; then
+    DAEMON_BIN="$cand"
+  else
+    DAEMON_BIN=""
+  fi
+}
+
+# ===== Сетевой IP =====
+get_server_ip(){
+  local ip
+  ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}')
+  [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
   echo "$ip"
 }
 
-# ===== Загрузка существующего порта =====
-load_existing_port() {
+# ===== Загрузка порта из существующего конфига =====
+load_existing_port(){
   if [[ -f "$CONF_FILE" ]]; then
     local port
     port=$(grep -E "^\s*internal:" "$CONF_FILE" | grep -oE "port\s*=\s*[0-9]+" | awk '{print $3}' | head -1)
     if [[ -n "$port" && "$port" =~ ^[0-9]+$ ]]; then
       PROXY_PORT=$port
-      info "Загружен порт из существующей конфигурации: $PROXY_PORT"
+      info "Загружен порт: $PROXY_PORT"
     fi
   fi
 }
 
-# ===== Генерация учёток =====
-generate_username() {
+# ===== Учетки =====
+generate_username(){
   local prefixes=("proxy" "socks" "user" "client" "vpn" "tunnel")
   local prefix=${prefixes[$RANDOM % ${#prefixes[@]}]}
   local number=$((RANDOM % 9000 + 1000))
   echo "${prefix}${number}"
 }
 
-generate_password() {
+generate_password(){
   local length=${1:-16}
   local chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*"
   local password=""
@@ -149,12 +162,12 @@ generate_password() {
   echo "$password"
 }
 
-generate_credentials() {
+generate_credentials(){
   PROXY_USER=$(generate_username)
   PROXY_PASS=$(generate_password 16)
   cat > "$CRED_FILE" << EOF
 # SOCKS5 Proxy Credentials
-# Generated on: $(date)
+# Generated: $(date)
 Username: $PROXY_USER
 Password: $PROXY_PASS
 Server: $(get_server_ip)
@@ -165,35 +178,31 @@ EOF
   log "Учетные данные сохранены в $CRED_FILE"
 }
 
-# ===== Создание файла паролей и PAM профиля =====
-create_user_file() {
+create_user_file(){
   if [[ "$USE_AUTH" == "true" ]]; then
-    log "Настройка PAM-аутентификации и файла паролей..."
+    log "Готовлю PAM и файл паролей..."
     htpasswd -b -B -C 10 -c "$PASSWD_FILE" "$PROXY_USER" "$PROXY_PASS"
     chmod 600 "$PASSWD_FILE"
-
     cat > "$PAM_FILE" << 'EOF'
 auth    required pam_pwdfile.so pwdfile /etc/danted.passwd
 account required pam_permit.so
 EOF
-    success "PAM и файл паролей готовы"
+    success "PAM профиль и файл паролей готовы"
   fi
 }
 
-# ===== Проверка порта =====
-check_port() {
+# ===== Порт =====
+check_port(){
   local port=${1:-$PROXY_PORT}
   if netstat -tlnp 2>/dev/null | grep -q ":$port "; then
     warning "Порт $port уже занят"
-    info "Занятый порт $port:"
     netstat -tlnp | grep ":$port " || true
     return 1
   fi
   return 0
 }
 
-# ===== Выбор порта =====
-select_port() {
+select_port(){
   local default_port=1080
   local port=$default_port
   load_existing_port
@@ -214,27 +223,19 @@ select_port() {
         echo -e "${RED}$((i+1)))${NC} $p ${RED}(занят)${NC}"
       fi
     done
-    echo -e "${GREEN}$(( ${#suggested_ports[@]} + 1 )))${NC} Ввести свой порт"
+    echo -e "${GREEN}$(( ${#suggested_ports[@]} + 1 ))${NC}) Ввести свой порт"
 
     while true; do
-      read -p "Выберите номер (1-$(( ${#suggested_ports[@]} + 1 ))): " choice
+      read -p "Выбор (1-$(( ${#suggested_ports[@]} + 1 ))): " choice
       if [[ "$choice" =~ ^[0-9]+$ ]]; then
         if [[ $choice -ge 1 && $choice -le ${#suggested_ports[@]} ]]; then
           port=${suggested_ports[$((choice-1))]}
-          if check_port "$port" 2>/dev/null; then
-            break
-          else
-            warning "Порт $port занят. Выберите другой."
-          fi
+          check_port "$port" && break || warning "Порт $port занят."
         elif [[ $choice -eq $(( ${#suggested_ports[@]} + 1 )) ]]; then
           while true; do
             read -p "Введите порт (1024-65535): " custom_port
             if [[ "$custom_port" =~ ^[0-9]+$ ]] && [[ $custom_port -ge 1024 && $custom_port -le 65535 ]]; then
-              if check_port "$custom_port" 2>/dev/null; then
-                port=$custom_port; break 2
-              else
-                warning "Порт $custom_port занят."
-              fi
+              check_port "$custom_port" && { port=$custom_port; break 2; } || warning "Порт $custom_port занят."
             else
               error "Некорректный порт."
             fi
@@ -252,27 +253,9 @@ select_port() {
   success "Выбран порт: $PROXY_PORT"
 }
 
-# ===== Настройка Dante =====
-setup_dante() {
-  log "Настройка Dante..."
-  select_port
-
-  local server_ip
-  server_ip=$(get_server_ip)
-  info "IP сервера: $server_ip"
-  info "Порт: $PROXY_PORT"
-
-  echo -e "${YELLOW}Выберите тип аутентификации:${NC}"
-  echo -e "${GREEN}1)${NC} С аутентификацией (логин/пароль — рекомендуется)"
-  echo -e "${GREEN}2)${NC} Без аутентификации (открытый прокси)"
-  read -p "Введите номер (1-2): " auth_choice
-
-  case $auth_choice in
-    1) USE_AUTH=true; info "Включена аутентификация"; generate_credentials; create_user_file ;;
-    2) USE_AUTH=false; info "Открытый прокси без аутентификации" ;;
-    *) USE_AUTH=true; warning "Неверный ввод — включена аутентификация по умолчанию"; generate_credentials; create_user_file ;;
-  esac
-
+# ===== Конфиг Dante =====
+write_config(){
+  local server_ip="$1"
   if [[ "$USE_AUTH" == "true" ]]; then
     cat > "$CONF_FILE" << EOF
 logoutput: syslog
@@ -304,26 +287,50 @@ client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 log: connect disconnect }
 socks  pass { from: 0.0.0.0/0 to: 0.0.0.0/0 log: connect disconnect }
 EOF
   fi
+  log "Конфигурация записана: $CONF_FILE"
+}
 
-  log "Конфигурация записана в $CONF_FILE"
-
-  # Валидация конфига
-  if sockd -t -f "$CONF_FILE" 2>/dev/null; then
-    success "Конфигурация валидна"
-  else
-    # fallback: короткий прогон
-    if timeout 2 sockd -f "$CONF_FILE" -N -D1 >/dev/null 2>&1; then
-      success "Конфигурация валидна (проверка в рантайме)"
-    else
-      error "Конфигурация некорректна"
-      exit 1
-    fi
+validate_config(){
+  # Некоторые сборки поддерживают -t; если нет — дадим фолбэк (короткий ран)
+  if "$DAEMON_BIN" -t -f "$CONF_FILE" >/dev/null 2>&1; then
+    success "Конфигурация валидна (-t)"
+    return 0
   fi
+  if timeout 2 "$DAEMON_BIN" -f "$CONF_FILE" -N -D1 >/dev/null 2>&1; then
+    success "Конфигурация валидна (рантайм проверка)"
+    return 0
+  fi
+  error "Конфигурация некорректна"
+  "$DAEMON_BIN" -t -f "$CONF_FILE" 2>/dev/null || true
+  return 1
+}
+
+setup_dante(){
+  log "Настройка Dante..."
+  select_port
+  local server_ip; server_ip=$(get_server_ip)
+  info "IP сервера: $server_ip"; info "Порт: $PROXY_PORT"
+
+  echo -e "${YELLOW}Выберите тип аутентификации:${NC}"
+  echo -e "${GREEN}1)${NC} С аутентификацией (логин/пароль — рекомендуется)"
+  echo -e "${GREEN}2)${NC} Без аутентификации (открытый прокси)"
+  read -p "Введите номер (1-2): " auth_choice
+
+  case $auth_choice in
+    1) USE_AUTH=true; info "Включена аутентификация"; generate_credentials; create_user_file ;;
+    2) USE_AUTH=false; info "Открытый прокси (без аутентификации)" ;;
+    *) USE_AUTH=true; warning "Неверный ввод — включена аутентификация по умолчанию"; generate_credentials; create_user_file ;;
+  esac
+
+  write_config "$server_ip"
+  validate_config
 }
 
 # ===== systemd unit =====
-create_service() {
+create_service(){
   log "Создание systemd юнита..."
+  # Если в рантайме бин сменится — подстрахуемся auto-резолвером
+  local DAEMON_START='$(type -P sockd || type -P danted || echo /usr/sbin/sockd)'
   cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=SOCKS5 Proxy Server (Dante)
@@ -331,7 +338,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/sockd -f $CONF_FILE
+ExecStart=${DAEMON_START} -f $CONF_FILE
 Restart=always
 RestartSec=5
 User=root
@@ -343,48 +350,34 @@ EOF
   success "Юнит создан: $SERVICE_FILE"
 }
 
-remove_service() {
+remove_service(){
   log "Удаление systemd юнита..."
-  if systemctl is-active --quiet socks5-proxy 2>/dev/null; then
-    systemctl stop socks5-proxy || true
-  fi
-  if systemctl is-enabled --quiet socks5-proxy 2>/dev/null; then
-    systemctl disable socks5-proxy || true
-  fi
-  if [[ -f "$SERVICE_FILE" ]]; then
-    rm -f "$SERVICE_FILE"
-    systemctl daemon-reload
-    success "Юнит удалён"
-  fi
+  systemctl stop socks5-proxy 2>/dev/null || true
+  systemctl disable socks5-proxy 2>/dev/null || true
+  [[ -f "$SERVICE_FILE" ]] && rm -f "$SERVICE_FILE" && systemctl daemon-reload && success "Юнит удалён"
 }
 
 # ===== Удаление конфигов =====
-remove_config() {
+remove_config(){
   log "Удаление конфигурационных файлов..."
-  [[ -f "$CONF_FILE" ]]    && rm -f "$CONF_FILE" && success "Удален $CONF_FILE"
-  [[ -f "$PASSWD_FILE" ]]  && rm -f "$PASSWD_FILE" && success "Удален $PASSWD_FILE"
-  [[ -f "$PAM_FILE" ]]     && rm -f "$PAM_FILE" && success "Удален $PAM_FILE"
-  [[ -f "$CRED_FILE" ]]    && rm -f "$CRED_FILE" && success "Удален $CRED_FILE"
+  [[ -f "$CONF_FILE" ]]   && rm -f "$CONF_FILE" && success "Удален $CONF_FILE"
+  [[ -f "$PASSWD_FILE" ]] && rm -f "$PASSWD_FILE" && success "Удален $PASSWD_FILE"
+  [[ -f "$PAM_FILE" ]]    && rm -f "$PAM_FILE" && success "Удален $PAM_FILE"
+  [[ -f "$CRED_FILE" ]]   && rm -f "$CRED_FILE" && success "Удален $CRED_FILE"
 }
 
 # ===== Управление сервисом =====
-manage_service() {
+manage_service(){
   local action=$1
   case $action in
     start)
       log "Запуск прокси..."
-      if ! check_port "$PROXY_PORT"; then
-        error "Порт $PROXY_PORT занят. Измени порт или останови конфликтующий сервис."
-        return 1
-      fi
+      resolve_daemon_bin
+      if [[ -z "$DAEMON_BIN" ]]; then error "Не найден бинарь sockd/danted"; return 1; fi
+      if ! check_port "$PROXY_PORT"; then error "Порт $PROXY_PORT занят"; return 1; fi
       systemctl enable --now socks5-proxy
       sleep 1
-      if systemctl is-active --quiet socks5-proxy; then
-        success "SOCKS5 прокси запущен и в автозагрузке"
-      else
-        error "Не удалось запустить прокси"
-        return 1
-      fi
+      systemctl is-active --quiet socks5-proxy && success "Прокси запущен" || { error "Не удалось запустить"; return 1; }
       ;;
     stop)     systemctl stop socks5-proxy; systemctl disable socks5-proxy || true; success "Прокси остановлен";;
     restart)  systemctl restart socks5-proxy; sleep 1; systemctl is-active --quiet socks5-proxy && success "Перезапущен" || { error "Не запустился"; return 1; };;
@@ -395,10 +388,9 @@ manage_service() {
 }
 
 # ===== Информация/учётки/диагностика =====
-show_info() {
+show_info(){
   load_existing_port
-  local server_ip
-  server_ip=$(get_server_ip)
+  local server_ip; server_ip=$(get_server_ip)
 
   echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
   echo -e "${CYAN}║                  ${WHITE}ИНФОРМАЦИЯ О ПРОКСИ${CYAN}                   ║${NC}"
@@ -406,20 +398,18 @@ show_info() {
   echo -e "${BOLD}Сервер:${NC} $server_ip"
   echo -e "${BOLD}Порт:${NC} $PROXY_PORT"
   echo -e "${BOLD}Тип:${NC} SOCKS5"
-
   if [[ -f "$PASSWD_FILE" ]]; then
     echo -e "${BOLD}Аутентификация:${NC} Да (PAM/libpam-pwdfile)"
     if [[ -f "$CRED_FILE" ]]; then
-      local username password
-      username=$(grep -E "^Username:" "$CRED_FILE" | sed 's/^Username:\s*//')
-      password=$(grep -E "^Password:" "$CRED_FILE" | sed 's/^Password:\s*//')
-      [[ -n "$username" ]] && echo -e "${BOLD}Логин:${NC} $username"
-      [[ -n "$password" ]] && echo -e "${BOLD}Пароль:${NC} $password"
+      local u p
+      u=$(grep -E "^Username:" "$CRED_FILE" | sed 's/^Username:\s*//')
+      p=$(grep -E "^Password:" "$CRED_FILE" | sed 's/^Password:\s*//')
+      [[ -n "$u" ]] && echo -e "${BOLD}Логин:${NC} $u"
+      [[ -n "$p" ]] && echo -e "${BOLD}Пароль:${NC} $p"
     fi
   else
     echo -e "${BOLD}Аутентификация:${NC} Нет"
   fi
-
   echo ""
   if systemctl is-active --quiet socks5-proxy 2>/dev/null; then
     echo -e "${GREEN}✓ Прокси работает${NC}"
@@ -428,18 +418,18 @@ show_info() {
   fi
 }
 
-show_credentials() {
+show_credentials(){
   echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
   echo -e "${CYAN}║                ${WHITE}УЧЕТНЫЕ ДАННЫЕ ПРОКСИ${CYAN}                 ║${NC}"
   echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
   if [[ -f "$CRED_FILE" ]]; then
     cat "$CRED_FILE"
   else
-    echo -e "${YELLOW}Файл с учетными данными не найден. Возможно, прокси без аутентификации.${NC}"
+    echo -e "${YELLOW}Файл с учетными данными не найден (возможно, режим без auth).${NC}"
   fi
 }
 
-diagnose() {
+diagnose(){
   load_existing_port
   echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
   echo -e "${YELLOW}║                  ${WHITE}ДИАГНОСТИКА ПРОКСИ${YELLOW}                  ║${NC}"
@@ -449,36 +439,41 @@ diagnose() {
   systemctl status socks5-proxy --no-pager || true
 
   echo -e "\n${BOLD}2) Проверка конфигурации:${NC}"
-  if sockd -t -f "$CONF_FILE" 2>/dev/null; then
-    echo -e "${GREEN}✓ Конфигурация корректна${NC}"
+  resolve_daemon_bin
+  if [[ -n "$DAEMON_BIN" ]] && "$DAEMON_BIN" -t -f "$CONF_FILE" >/dev/null 2>&1; then
+    echo -e "${GREEN}✓ Конфигурация корректна (-t)${NC}"
   else
-    echo -e "${RED}✗ Проблемы в конфигурации${NC}"
-    sockd -t -f "$CONF_FILE" || true
+    echo -e "${YELLOW}Фолбэк проверка (рантайм)...${NC}"
+    if timeout 2 ${DAEMON_BIN:-/usr/sbin/sockd} -f "$CONF_FILE" -N -D1 >/dev/null 2>&1; then
+      echo -e "${GREEN}✓ Конфигурация корректна (рантайм)${NC}"
+    else
+      echo -e "${RED}✗ Проблемы в конфигурации${NC}"
+      ${DAEMON_BIN:-/usr/sbin/sockd} -t -f "$CONF_FILE" 2>/dev/null || true
+    fi
   fi
 
-  echo -e "\n${BOLD}3) Проверка порта $PROXY_PORT:${NC}"
+  echo -e "\n${BOLD}3) Прослушивание порта $PROXY_PORT:${NC}"
   if netstat -tlnp 2>/dev/null | grep -q ":$PROXY_PORT "; then
-    echo -e "${GREEN}✓ Порт $PROXY_PORT слушается${NC}"
+    echo -e "${GREEN}✓ Порт слушается${NC}"
     netstat -tlnp | grep ":$PROXY_PORT " || true
   else
-    echo -e "${RED}✗ Порт $PROXY_PORT свободен (сервис не слушает)${NC}"
+    echo -e "${RED}✗ Порт свободен (сервис не слушает)${NC}"
   fi
 
   echo -e "\n${BOLD}4) Файл паролей:${NC}"
   if [[ -f "$PASSWD_FILE" ]]; then
     echo -e "${GREEN}✓ Найден $PASSWD_FILE${NC}"
-    echo "Пользователи:"
-    cut -d: -f1 "$PASSWD_FILE"
+    echo "Пользователи:"; cut -d: -f1 "$PASSWD_FILE"
   else
     echo -e "${YELLOW}⚠ Файл паролей не найден (возможно, режим без аутентификации)${NC}"
   fi
 
-  echo -e "\n${BOLD}5) Последние логи systemd:${NC}"
+  echo -e "\n${BOLD}5) Последние логи:${NC}"
   journalctl -u socks5-proxy --no-pager -n 50 || true
 }
 
-# ===== Деинсталл =====
-remove_dependencies() {
+# ===== Деинсталляция =====
+remove_dependencies(){
   log "Удаление пакетов..."
   systemctl stop socks5-proxy 2>/dev/null || true
   force_kill_apt
@@ -487,14 +482,13 @@ remove_dependencies() {
   success "Пакеты удалены"
 }
 
-uninstall() {
+uninstall(){
   echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
   echo -e "${RED}║                    ${WHITE}УДАЛЕНИЕ ПРОКСИ${RED}                        ║${NC}"
   echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
-  echo -e "${YELLOW}Будут удалены: сервис, конфиги, PAM и пакеты Dante/PAM.${NC}"
+  echo -e "${YELLOW}Будут удалены сервис, конфиги, PAM и пакеты Dante/PAM.${NC}"
   read -p "Вы уверены? (y/N): " -n 1 -r; echo
   [[ $REPLY =~ ^[Yy]$ ]] || { log "Отменено"; return 0; }
-
   remove_service
   remove_config
   remove_dependencies
@@ -502,7 +496,7 @@ uninstall() {
 }
 
 # ===== Меню/обвязка =====
-show_menu() {
+show_menu(){
   show_banner
   echo -e "${WHITE}Выберите действие:${NC}\n"
   echo -e "${GREEN}1)${NC} Установить SOCKS5 прокси"
@@ -520,7 +514,7 @@ show_menu() {
   echo -e "\n${PURPLE}Подсказка:${NC} sudo $0 {install|start|stop|restart|status|logs|info|credentials|regenerate|diagnose|uninstall|menu}"
 }
 
-handle_menu_choice() {
+handle_menu_choice(){
   local choice=$1
   case $choice in
     1) install_proxy ;;
@@ -539,7 +533,7 @@ handle_menu_choice() {
   esac
 }
 
-install_proxy() {
+install_proxy(){
   log "Установка SOCKS5 прокси..."
   check_system
   install_dependencies
@@ -553,7 +547,7 @@ install_proxy() {
   fi
 }
 
-interactive_menu() {
+interactive_menu(){
   while true; do
     show_menu
     read -p "Введите номер действия (0-11): " choice
@@ -565,7 +559,7 @@ interactive_menu() {
   done
 }
 
-main() {
+main(){
   if [[ $# -gt 0 ]]; then
     case $1 in
       install)     check_root; install_proxy ;;
@@ -584,5 +578,4 @@ main() {
   fi
 }
 
-# ===== Запуск =====
 main "$@"
